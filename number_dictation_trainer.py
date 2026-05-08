@@ -12,6 +12,7 @@ A small Python app for listening practice:
 Open-source/local-friendly stack:
 - tkinter: built into Python for the GUI
 - pyttsx3: offline text-to-speech engine
+- gTTS: cleaner online text-to-speech using Google Translate TTS
 - num2words: converts numbers into words in many languages
 
 Create and use a local virtual environment:
@@ -20,14 +21,14 @@ macOS/Linux:
     python3 -m venv .venv
     source .venv/bin/activate
     python -m pip install --upgrade pip
-    pip install pyttsx3 num2words
+    pip install pyttsx3 num2words gTTS
     python number_dictation_trainer.py
 
 Windows PowerShell:
     py -m venv .venv
     .venv\Scripts\Activate.ps1
     python -m pip install --upgrade pip
-    pip install pyttsx3 num2words
+    pip install pyttsx3 num2words gTTS
     python number_dictation_trainer.py
 
 After you are done:
@@ -41,14 +42,19 @@ Notes:
 
 from __future__ import annotations
 
+import os
 import random
 import re
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import ttk, messagebox
 
 import pyttsx3
+from gtts import gTTS
 from num2words import num2words
 
 
@@ -93,15 +99,53 @@ class SpeechEngine:
 
         return None
 
-    def speak(self, text: str, rate: int, volume: float, language: LanguageOption) -> str | None:
+    def speak_offline(self, text: str, rate: int, volume: float, language: LanguageOption) -> str | None:
+        """Speak with pyttsx3. Fully offline, but voice quality depends on system voices."""
+        selected_voice = self.set_voice_for_language(language)
+        self.engine.setProperty("rate", rate)
+        self.engine.setProperty("volume", volume)
+        self.engine.say(text)
+        self.engine.runAndWait()
+        return selected_voice
+
+    def speak_gtts(self, text: str, language: LanguageOption) -> str:
+        """Speak with gTTS. Cleaner voice, but requires internet."""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+            filename = temp_audio.name
+
+        try:
+            tts = gTTS(text=text, lang=language.num2words_code, slow=False)
+            tts.save(filename)
+            self.play_audio_file(filename)
+            return "gTTS / Google Translate voice"
+        finally:
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+
+    def play_audio_file(self, filename: str) -> None:
+        if sys.platform == "darwin":
+            subprocess.run(["afplay", filename], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(filename)  # type: ignore[attr-defined]
+        else:
+            players = (["mpg123", filename], ["ffplay", "-nodisp", "-autoexit", filename], ["xdg-open", filename])
+            last_error: Exception | None = None
+            for command in players:
+                try:
+                    subprocess.run(command, check=True)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+            raise RuntimeError(f"Could not play audio file. Last error: {last_error}")
+
+    def speak(self, text: str, rate: int, volume: float, language: LanguageOption, engine_name: str) -> str | None:
         """Speak in a background-safe way. Returns selected voice name if found."""
         with self.lock:
-            selected_voice = self.set_voice_for_language(language)
-            self.engine.setProperty("rate", rate)
-            self.engine.setProperty("volume", volume)
-            self.engine.say(text)
-            self.engine.runAndWait()
-            return selected_voice
+            if engine_name == "Cleaner online voice - gTTS":
+                return self.speak_gtts(text, language)
+            return self.speak_offline(text, rate=rate, volume=volume, language=language)
 
 
 class NumberDictationTrainer(tk.Tk):
@@ -120,6 +164,7 @@ class NumberDictationTrainer(tk.Tk):
         self.min_var = tk.StringVar(value="1")
         self.max_var = tk.StringVar(value="1000")
         self.language_var = tk.StringVar(value="Italian")
+        self.tts_engine_var = tk.StringVar(value="Cleaner online voice - gTTS")
         self.answer_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Choose a range, then press New Number.")
         self.voice_var = tk.StringVar(value="Voice: not selected yet")
@@ -164,13 +209,23 @@ class NumberDictationTrainer(tk.Tk):
         )
         lang_box.grid(row=1, column=2, sticky="w", padx=(0, 16))
 
-        ttk.Label(settings, text="Speech speed").grid(row=0, column=3, sticky="w")
+        ttk.Label(settings, text="Voice engine").grid(row=0, column=3, sticky="w")
+        engine_box = ttk.Combobox(
+            settings,
+            textvariable=self.tts_engine_var,
+            values=["Cleaner online voice - gTTS", "Offline system voice - pyttsx3"],
+            state="readonly",
+            width=28,
+        )
+        engine_box.grid(row=1, column=3, sticky="w", padx=(0, 16))
+
+        ttk.Label(settings, text="Offline speech speed").grid(row=2, column=0, sticky="w", pady=(12, 0))
         ttk.Scale(settings, from_=90, to=220, variable=self.rate_var, orient="horizontal", length=150).grid(
-            row=1, column=3, sticky="w"
+            row=3, column=0, columnspan=2, sticky="w"
         )
 
         ttk.Checkbutton(settings, text="Show answer after checking", variable=self.show_answer_var).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(12, 0)
+            row=4, column=0, columnspan=4, sticky="w", pady=(12, 0)
         )
 
         main = ttk.Frame(outer, padding=(0, 20, 0, 0))
@@ -261,7 +316,13 @@ class NumberDictationTrainer(tk.Tk):
 
         def worker() -> None:
             try:
-                selected_voice = self.speech.speak(text, rate=rate, volume=1.0, language=language)
+                selected_voice = self.speech.speak(
+                    text,
+                    rate=rate,
+                    volume=1.0,
+                    language=language,
+                    engine_name=self.tts_engine_var.get(),
+                )
                 voice_text = f"Voice: {selected_voice}" if selected_voice else "Voice: no matching system voice found; using default voice"
                 self.after(0, lambda: self.voice_var.set(voice_text))
             except Exception as exc:  # noqa: BLE001 - friendly GUI error
